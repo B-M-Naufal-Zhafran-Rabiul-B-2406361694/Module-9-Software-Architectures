@@ -93,3 +93,33 @@ Beberapa observasi setelah menjalankan publisher & subscriber:
 6. **Library `crosstown_bus` di-*pin* ke versi lama.** Saya harus pin `crosstown_bus = "=0.5.3"` di subscriber dan `=0.5.0` di publisher karena versi `0.5.4` menambah method baru di trait `MessageHandler` yang membuat kode tutorial gagal compile. Library ini terlihat tidak aktif di-maintain — untuk proyek serius, pertimbangkan client AMQP modern Rust seperti **[lapin](https://crates.io/crates/lapin)** yang berbasis async/tokio dan komunitasnya jauh lebih besar.
 7. **Variabel unused di handler.** `let now = time::Instant::now();` ditulis tapi tidak dipakai (mungkin sisa contoh pengukuran waktu). Hapus saja, atau kalau memang ingin mengukur lama proses tiap pesan, log selisihnya: `println!("processed in {:?}", now.elapsed())`.
 8. **Tidak ada *publisher confirm* / persistence.** Pesan dipublish ke queue yang `durable: false` dan tanpa publisher confirm. Kalau broker restart, semua pesan in-flight hilang dan publisher juga tidak tahu bahwa pesan tidak benar-benar diterima. Untuk delivery garansi, ubah ke `durable: true` + aktifkan publisher confirm.
+
+## Bonus: Simulating Slow Subscriber di Broker Cloud
+
+Eksperimen *slow subscriber* diulang dengan broker dipindah dari Docker lokal ke **CloudAMQP** (managed RabbitMQ, plan gratis "Little Lemur" region AWS Asia Pacific). URL broker dibaca dari environment variable `AMQP_URL` dengan fallback ke localhost:
+
+```rust
+let amqp_url = std::env::var("AMQP_URL")
+    .unwrap_or_else(|_| "amqp://guest:guest@localhost:5672".to_owned());
+let listener = CrosstownBus::new_queue_listener(amqp_url).unwrap();
+```
+
+Cara jalankan:
+
+```bash
+AMQP_URL='amqps://USER:PASS@HOST/VHOST' cargo run
+```
+
+Skema `amqps://` (TLS port 5671) sudah dibuka di firewall CloudAMQP, jadi tidak ada konfigurasi tambahan dari sisi user.
+
+Setelah subscriber terhubung ke cloud (dengan `thread::sleep` aktif = 1 detik per pesan), publisher di-*fire* 8x berturut-turut (40 pesan). Hasilnya di CloudAMQP Management UI:
+
+![Slow subscriber via CloudAMQP — antrian Ready menumpuk lalu turun pelan](cloud-slow-subscriber.png)
+
+Pola yang terlihat persis sama dengan eksperimen lokal: lonjakan Ready ke puluhan pesan, lalu turun linear ±1 msg/detik karena subscriber memang dibatasi `thread::sleep(1000ms)`. Perbedaan kentara dari versi lokal:
+
+- URL bar = `armadillo.rmq.cloudamqp.com` (cloud), bukan `localhost`.
+- Versi broker RabbitMQ `4.2.4` vs lokal `3.13`.
+- Latensi tiap pesan jauh lebih besar karena hop ekstra mesin lokal → datacenter CloudAMQP → balik ke mesin lokal lewat TLS — tapi pola antrian *backpressure* tetap sama, broker tetap menahan pesan yang belum sempat di-consume.
+
+Yang membuktikan poin event-driven architecture: **publisher dan subscriber sama sekali tidak diubah** untuk pindah dari Docker lokal ke broker cloud. Cukup ganti satu environment variable. Itulah keuntungan dari *decoupling* via message broker — lokasi fisik broker hanya detail deployment, bukan urusan kode aplikasi.
