@@ -54,3 +54,42 @@ Pada eksekusi di mesin saya, baris **Ready** di chart *Queued messages* memuncak
 - **Kenapa slope turunnya linear?** Karena subscriber memproses dengan rate konstan ±1 msg/detik (akibat `thread::sleep` yang fixed). Tiap detik, queue berkurang persis 1 pesan, sehingga garisnya turun lurus, bukan eksponensial.
 - **Kenapa angkanya bukan 40?** Ada dua sebab: (1) saat saya membuka browser dan men-*screenshot*, sebagian pesan sudah keburu di-*consume* — kira-kira 20-an pesan sudah selesai sebelum tangkapan layar dibuat. (2) Chart *last minute* di RabbitMQ menampilkan **sample teragregasi** (titik per 5 detik), bukan nilai puncak sesaat, jadi angkanya tampak sedikit lebih halus daripada lonjakan sebenarnya.
 - **Apa artinya bagi sistem nyata?** Tepat seperti analogi SIAK War: kalau backend (consumer) lebih lambat dari rate request, queue akan terus tumbuh. Tanpa message broker, kelebihan beban itu langsung memukul backend dan bisa membuatnya *crash*. Dengan broker di tengah, beban "diserap" sementara di queue, dan backend bisa menggerusnya pelan-pelan sesuai kecepatannya tanpa kehilangan pesan — *trade-off*-nya adalah *latency* pesan jadi naik.
+
+## Running at Least Three Subscribers
+
+Karena subscriber lambat (1 detik per pesan), solusinya adalah men-*scale out* — jalankan beberapa instance subscriber sekaligus, semuanya *consume* queue yang sama (`user_created`). Caranya: buka 3 terminal terpisah, di tiap terminal `cd subscriber && cargo run`, lalu *fire* publisher beberapa kali di terminal ke-4.
+
+Hasil dari satu sesi `8 × cargo run publisher` (total 40 pesan) yang saya jalankan:
+
+| Instance | Pesan diterima |
+|---|---|
+| Subscriber #1 | 14 |
+| Subscriber #2 | 13 |
+| Subscriber #3 | 13 |
+| **Total** | **40** |
+
+Distribusi nyaris seimbang — itu karena RabbitMQ secara default menggunakan algoritma **round-robin** untuk membagikan pesan ke semua consumer yang sedang aktif di queue yang sama. Setiap consumer dapat pesan secara bergantian, dan tidak ada satu pun pesan yang diproses dua kali (kecuali kasus *redelivery*).
+
+Tampilan RabbitMQ Management UI saat 3 subscriber terhubung dan publisher di-*fire* berulang:
+
+![Tiga subscriber paralel — queue cepat menyusut](three-subscribers.png)
+
+### Kenapa spike queue lebih cepat redup dibanding sebelumnya?
+
+- **Throughput menjadi N×.** Dengan 3 consumer yang masing-masing 1 msg/detik, total *deliver rate* efektif menjadi ±3 msg/detik. Untuk batch 40 pesan, drain selesai dalam ±13 detik — vs ±40 detik saat hanya 1 consumer.
+- **Slope turunnya 3x lebih curam.** Bandingkan dengan grafik di section *Simulating Slow Subscriber*: di sana slope turun ±1 msg/detik, di sini ±3 msg/detik.
+- **Bukti di Global counts:** `Connections: 3, Channels: 3, Consumers: 3` (sebelumnya 1/1/1) — RabbitMQ mendaftarkan ketiga subscriber sebagai consumer terpisah pada queue `user_created`.
+- **Implikasi arsitektural.** Inilah kekuatan utama event-driven + message broker: *horizontal scaling* consumer **tidak perlu mengubah publisher sama sekali**. Kalau besok beban naik 10x, cukup tambah instance subscriber, broker otomatis membagi beban. Publisher tidak perlu tahu ada berapa subscriber.
+
+### Refleksi: hal-hal yang bisa diperbaiki di kode
+
+Beberapa observasi setelah menjalankan publisher & subscriber:
+
+1. **Error pada `publish_event` di-*discard*.** Di [publisher/src/main.rs](https://github.com/B-M-Naufal-Zhafran-Rabiul-B-2406361694/Module-9-Software-Architectures-Publisher) tiap pemanggilan ditulis `_ = p.publish_event(...)`. Kalau koneksi ke broker putus saat pesan ke-3, kesalahannya hilang tanpa jejak. Lebih baik propagate via `?` (mengubah `fn main()` jadi `fn main() -> Result<(), Box<dyn Error>>`) atau minimal `eprintln!` log error sebelum dibuang.
+2. **`UserCreatedEventMessage` di-*duplikasi* di dua repo.** Sekarang struct yang sama persis didefinisikan di subscriber **dan** publisher. Kalau ada satu field baru, dua repo wajib diubah konsisten — celah desync klasik. Idealnya tipe event dipindah ke *crate library* terpisah (`events-shared`) yang di-import oleh keduanya.
+3. **`loop {}` di subscriber adalah *busy spin*.** Setelah `listener.listen(...)` mendaftar, thread utama hanya perlu menahan proses tetap hidup. `loop {}` membakar 100% satu core CPU tanpa tujuan. Cukup ganti dengan `std::thread::park();` atau menunggu sinyal Ctrl-C agar idle dengan benar.
+4. **Tidak ada graceful shutdown.** Ctrl-C langsung memutus koneksi, padahal mungkin masih ada pesan yang sedang diproses (`unacked`). Idealnya tangkap sinyal SIGINT, hentikan penerimaan pesan baru, tunggu *handler* yang berjalan selesai, baru tutup channel.
+5. **Konfigurasi *hardcoded*.** URL broker, nama queue, nilai *user_name* contoh, semua ditulis langsung di `main.rs`. Pindahkan ke *environment variable* atau argumen CLI agar mudah di-*deploy* ke staging/production tanpa rebuild.
+6. **Library `crosstown_bus` di-*pin* ke versi lama.** Saya harus pin `crosstown_bus = "=0.5.3"` di subscriber dan `=0.5.0` di publisher karena versi `0.5.4` menambah method baru di trait `MessageHandler` yang membuat kode tutorial gagal compile. Library ini terlihat tidak aktif di-maintain — untuk proyek serius, pertimbangkan client AMQP modern Rust seperti **[lapin](https://crates.io/crates/lapin)** yang berbasis async/tokio dan komunitasnya jauh lebih besar.
+7. **Variabel unused di handler.** `let now = time::Instant::now();` ditulis tapi tidak dipakai (mungkin sisa contoh pengukuran waktu). Hapus saja, atau kalau memang ingin mengukur lama proses tiap pesan, log selisihnya: `println!("processed in {:?}", now.elapsed())`.
+8. **Tidak ada *publisher confirm* / persistence.** Pesan dipublish ke queue yang `durable: false` dan tanpa publisher confirm. Kalau broker restart, semua pesan in-flight hilang dan publisher juga tidak tahu bahwa pesan tidak benar-benar diterima. Untuk delivery garansi, ubah ke `durable: true` + aktifkan publisher confirm.
